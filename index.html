@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Toolify - File Locker Pro</title>
+
+<style>
+body {
+  font-family: Arial;
+  background: #f4f6f8;
+  max-width: 850px;
+  margin: auto;
+  padding: 20px;
+}
+
+.card {
+  background: white;
+  padding: 20px;
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+h2 {
+  text-align: center;
+}
+
+.dropzone {
+  border: 2px dashed #2d6cdf;
+  padding: 30px;
+  text-align: center;
+  border-radius: 10px;
+  cursor: pointer;
+  margin-top: 10px;
+  background: #fafafa;
+}
+
+input, button {
+  width: 100%;
+  padding: 12px;
+  margin-top: 10px;
+  border-radius: 6px;
+}
+
+button {
+  border: none;
+  color: white;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.lock { background: #2d6cdf; }
+.unlock { background: #444; }
+
+#status {
+  margin-top: 10px;
+  font-size: 14px;
+  color: #333;
+}
+</style>
+</head>
+
+<body>
+
+<div class="card">
+  <h2>🔐 File Locker Pro</h2>
+
+  <div class="dropzone" id="dropzone">
+    Click or Drag & Drop File Here
+  </div>
+
+  <input type="file" id="fileInput" style="display:none">
+
+  <input type="password" id="password" placeholder="Enter password">
+
+  <button class="lock" onclick="lockFile()">Lock File</button>
+  <button class="unlock" onclick="unlockFile()">Unlock File</button>
+
+  <div id="status"></div>
+</div>
+
+<script>
+let fileBuffer = null;
+let fileName = "";
+
+/* ---------------- UI FILE SELECT ---------------- */
+const dropzone = document.getElementById("dropzone");
+const fileInput = document.getElementById("fileInput");
+const status = document.getElementById("status");
+
+dropzone.onclick = () => fileInput.click();
+
+fileInput.addEventListener("change", e => {
+  handleFile(e.target.files[0]);
+});
+
+dropzone.addEventListener("dragover", e => e.preventDefault());
+
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  handleFile(e.dataTransfer.files[0]);
+});
+
+function handleFile(file) {
+  if (!file) return;
+
+  fileName = file.name;
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    fileBuffer = reader.result;
+    status.innerText = "Selected: " + fileName;
+  };
+
+  reader.readAsArrayBuffer(file);
+}
+
+/* ---------------- WEB WORKER (NO FREEZE) ---------------- */
+const worker = new Worker(URL.createObjectURL(new Blob([`
+
+self.cryptoKey = null;
+
+function bufToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBuf(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function getKey(password, salt) {
+  const enc = new TextEncoder();
+
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+self.onmessage = async (e) => {
+  const { type, file, password } = e.data;
+
+  if (type === "lock") {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+
+    const key = await getKey(password, salt);
+
+    const encrypted = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      file
+    );
+
+    self.postMessage({
+      type: "locked",
+      data: {
+        name: "file.locked",
+        salt: bufToBase64(salt),
+        iv: bufToBase64(iv),
+        data: bufToBase64(encrypted)
+      }
+    });
+  }
+
+  if (type === "unlock") {
+    try {
+      const obj = JSON.parse(new TextDecoder().decode(file));
+
+      const salt = base64ToBuf(obj.salt);
+      const iv = base64ToBuf(obj.iv);
+      const data = base64ToBuf(obj.data);
+
+      const key = await getKey(password, salt);
+
+      const decrypted = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv },
+        key,
+        data
+      );
+
+      self.postMessage({
+        type: "unlocked",
+        data: {
+          buffer: decrypted,
+          name: obj.name
+        }
+      });
+
+    } catch (err) {
+      self.postMessage({ type: "error" });
+    }
+  }
+};
+
+`], { type: "application/javascript" })));
+
+/* ---------------- WORKER EVENTS ---------------- */
+worker.onmessage = (e) => {
+  const msg = e.data;
+
+  if (msg.type === "locked") {
+    download(
+      new Blob([JSON.stringify(msg.data)], { type: "application/json" }),
+      fileName + ".locked"
+    );
+    status.innerText = "File locked successfully!";
+  }
+
+  if (msg.type === "unlocked") {
+    download(
+      new Blob([msg.data.buffer]),
+      "unlocked_" + msg.data.name
+    );
+    status.innerText = "File unlocked successfully!";
+  }
+
+  if (msg.type === "error") {
+    alert("Wrong password or corrupted file!");
+    status.innerText = "";
+  }
+};
+
+/* ---------------- ACTIONS ---------------- */
+function lockFile() {
+  const password = document.getElementById("password").value;
+
+  if (!fileBuffer) return alert("Select file first");
+  if (!password) return alert("Enter password");
+
+  status.innerText = "Encrypting...";
+
+  worker.postMessage({
+    type: "lock",
+    file: fileBuffer,
+    password
+  });
+}
+
+function unlockFile() {
+  const password = document.getElementById("password").value;
+
+  if (!fileBuffer) return alert("Select locked file");
+  if (!password) return alert("Enter password");
+
+  status.innerText = "Decrypting...";
+
+  worker.postMessage({
+    type: "unlock",
+    file: fileBuffer,
+    password
+  });
+}
+
+/* ---------------- DOWNLOAD FIXED ---------------- */
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement("a");
+  a.style.display = "none";
+  a.href = url;
+  a.download = name;
+
+  document.body.appendChild(a);
+  a.click();
+
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 200);
+}
+</script>
+
+</body>
+</html>
